@@ -105,10 +105,14 @@ static int configure_baudrate(const struct device *dev, bool valset_supported)
 	return err;
 }
 
+static int reopen_modem(struct u_blox_iface_data *data);
+
 static int init_modem(struct u_blox_iface_data *data, const struct u_blox_iface_config *cfg,
 			 const struct modem_ubx_match *unsol, size_t unsol_size)
 {
-	int err;
+	/* PM-enabled initialization intentionally leaves the pipe closed, so no
+	 * later operation assigns err on that path. */
+	int err = 0;
 
 	const struct modem_ubx_config ubx_config = {
 		.user_data = (void *)&data->common_data,
@@ -132,33 +136,50 @@ static int init_modem(struct u_blox_iface_data *data, const struct u_blox_iface_
 
 	data->backend.pipe = modem_backend_uart_init(&data->backend.uart_backend,
 						     &uart_backend_config);
-	err = modem_pipe_open(data->backend.pipe, K_SECONDS(1));
-	if (err != 0) {
-		LOG_ERR("Failed to open Modem pipe: %d", err);
-		return err;
+	if (data->backend.pipe == NULL) {
+		LOG_ERR("Failed to initialize modem backend");
+		return -ENODEV;
 	}
 
-	err = modem_ubx_attach(&data->ubx.inst, data->backend.pipe);
-	if (err != 0) {
-		LOG_ERR("Failed to attach UBX inst to modem pipe: %d", err);
-		return err;
-	}
-
+	/* These objects survive runtime suspend/resume.  Do not initialize them
+	 * in the resume path: a suspended interface retains its parser state and
+	 * its script serialization contract.
+	 */
 	(void)k_sem_init(&data->script.lock, 1, 1);
 	(void)k_sem_init(&data->script.req_buf_lock, 1, 1);
 
 	data->script.inst.response.buf = data->script.response_buf;
 	data->script.inst.response.buf_len = sizeof(data->script.response_buf);
+	/* No pipe is opened here.  CONFIG_PM_DEVICE leaves this setup dormant
+	 * until the device PM resume action, while legacy builds reopen below.
+	 */
+	data->script.active = false;
+
+#if !CONFIG_PM_DEVICE
+	/* Without device PM the legacy driver behavior is to start receiving at
+	 * boot.  PM-enabled M10 devices stay detached until their first resume.
+	 */
+	err = reopen_modem(data);
+#endif
 
 	return err;
 }
 
-static int reattach_modem(struct u_blox_iface_data *data)
+/*
+ * modem_pipe keeps its open/closed event bits after close.  Resetting just
+ * the pipe object while it is detached makes the existing UART backend call
+ * its open operation again.  The backend, UBX parser, receive buffers, and
+ * semaphores are intentionally not reinitialized here.
+ *
+ * The caller holds script.lock, which excludes both UBX scripts and parser
+ * callbacks while the pipe is detached.
+ */
+static int reopen_modem(struct u_blox_iface_data *data)
 {
 	int err;
 
-	(void)modem_ubx_release(&data->ubx.inst);
-	(void)modem_pipe_close(data->backend.pipe, K_SECONDS(1));
+	modem_pipe_init(data->backend.pipe, data->backend.pipe->data,
+			data->backend.pipe->api);
 
 	err = modem_pipe_open(data->backend.pipe, K_SECONDS(1));
 	if (err != 0) {
@@ -169,24 +190,105 @@ static int reattach_modem(struct u_blox_iface_data *data)
 	err = modem_ubx_attach(&data->ubx.inst, data->backend.pipe);
 	if (err != 0) {
 		LOG_ERR("Failed to re-attach modem pipe to UBX inst: %d", err);
+		(void)modem_pipe_close(data->backend.pipe, K_SECONDS(1));
+		return err;
 	}
 
 	return 0;
 }
 
-static int msg_get(const struct device *dev, const struct ubx_frame *req,
-		   size_t len, void *rsp, size_t min_rsp_size,
-		   k_timeout_t timeout, uint16_t retry_count)
+/* Caller holds script.lock. */
+static int suspend_modem(struct u_blox_iface_data *data)
+{
+	int err;
+
+	if (!data->script.active) {
+		return 0;
+	}
+
+	/* Mark inactive before release so that a later message API call observes
+	 * the suspended interface immediately after it obtains script.lock.
+	 */
+	data->script.active = false;
+	modem_ubx_release(&data->ubx.inst);
+	err = modem_pipe_close(data->backend.pipe, K_SECONDS(1));
+	if (err != 0) {
+		LOG_ERR("Failed to close modem pipe: %d", err);
+	}
+
+	return err;
+}
+
+int u_blox_iface_suspend(const struct device *dev)
 {
 	struct u_blox_iface_data *data = dev->data;
-	struct ubx_frame *rsp_frame = (struct ubx_frame *)data->script.inst.response.buf;
 	int err;
 
 	err = k_sem_take(&data->script.lock, K_SECONDS(3));
 	if (err != 0) {
-		LOG_ERR("Failed to take script lock: %d", err);
+		LOG_ERR("Failed to take script lock for suspend: %d", err);
 		return err;
 	}
+
+	err = suspend_modem(data);
+	k_sem_give(&data->script.lock);
+
+	return err;
+}
+
+int u_blox_iface_resume(const struct device *dev)
+{
+	struct u_blox_iface_data *data = dev->data;
+	int err;
+
+	err = k_sem_take(&data->script.lock, K_SECONDS(3));
+	if (err != 0) {
+		LOG_ERR("Failed to take script lock for resume: %d", err);
+		return err;
+	}
+
+	if (data->script.active) {
+		err = 0;
+	} else {
+		err = reopen_modem(data);
+		if (err == 0) {
+			data->script.active = true;
+		}
+	}
+
+	k_sem_give(&data->script.lock);
+
+	return err;
+}
+
+int u_blox_iface_configure_baudrate(const struct device *dev, bool valset_supported)
+{
+	int err;
+
+	err = configure_baudrate(dev, valset_supported);
+	if (err < 0) {
+		return err;
+	}
+
+	/* UART framing changed under the backend.  Detach and reopen the retained
+	 * pipe so its callbacks observe the newly configured UART cleanly.
+	 */
+	err = u_blox_iface_suspend(dev);
+	if (err < 0) {
+		return err;
+	}
+
+	return u_blox_iface_resume(dev);
+}
+
+/* Caller holds script.lock and has checked script.active. */
+static int msg_get_locked(const struct device *dev, const struct ubx_frame *req,
+			  size_t len, void *rsp, size_t min_rsp_size,
+			  k_timeout_t timeout, uint16_t retry_count)
+{
+	struct u_blox_iface_data *data = dev->data;
+	struct ubx_frame *rsp_frame = (struct ubx_frame *)data->script.inst.response.buf;
+	int err;
 
 	data->script.inst.timeout = timeout;
 	data->script.inst.retry_count = retry_count;
@@ -201,8 +303,6 @@ static int msg_get(const struct device *dev, const struct ubx_frame *req,
 	} else {
 		memcpy(rsp, rsp_frame->payload_and_checksum, min_rsp_size);
 	}
-
-	k_sem_give(&data->script.lock);
 
 	return err;
 }
@@ -246,6 +346,13 @@ int u_blox_iface_init(const struct device *dev, const struct modem_ubx_match *un
 		return err;
 	}
 
+#if CONFIG_PM_DEVICE
+	/* The M10 device starts suspended.  Its PM resume action opens the UART
+	 * and applies receiver-specific configuration before publishing data.
+	 */
+	return 0;
+#endif
+
 	mon_ver_len = ubx_frame_encode(UBX_CLASS_ID_MON, UBX_MSG_ID_MON_VER,
 			NULL, 0, mon_ver_buf, sizeof(mon_ver_buf));
 	if (mon_ver_len < 0) {
@@ -255,21 +362,19 @@ int u_blox_iface_init(const struct device *dev, const struct modem_ubx_match *un
 	/* Poll the receiver for the version, if it is successful then the baudrate is
 	 * already the desired one and there is nothing more to do.
 	 */
-	err = msg_get(dev, (struct ubx_frame *)mon_ver_buf, mon_ver_len,
-		      (void *)&ver, sizeof(ver), K_MSEC(200), 0);
+	err = k_sem_take(&data->script.lock, K_SECONDS(3));
+	if (err == 0) {
+		err = msg_get_locked(dev, (struct ubx_frame *)mon_ver_buf, mon_ver_len,
+				     (void *)&ver, sizeof(ver), K_MSEC(200), 0);
+		k_sem_give(&data->script.lock);
+	}
 	if (err == 0) {
 		return 0;
 	}
 
-	err = configure_baudrate(dev, valset_supported);
+	err = u_blox_iface_configure_baudrate(dev, valset_supported);
 	if (err < 0) {
-		LOG_ERR("Failed to configure baud-rate: %d", err);
-		return err;
-	}
-
-	err = reattach_modem(data);
-	if (err < 0) {
-		LOG_ERR("Failed to re-attach modem: %d", err);
+		LOG_ERR("Failed to configure baud-rate and re-attach modem: %d", err);
 		return err;
 	}
 
@@ -279,7 +384,24 @@ int u_blox_iface_init(const struct device *dev, const struct modem_ubx_match *un
 int u_blox_iface_msg_get(const struct device *dev, const struct ubx_frame *req,
 			 size_t len, void *rsp, size_t min_rsp_size)
 {
-	return msg_get(dev, req, len, rsp, min_rsp_size, K_SECONDS(3), 2);
+	struct u_blox_iface_data *data = dev->data;
+	int err;
+
+	err = k_sem_take(&data->script.lock, K_SECONDS(3));
+	if (err != 0) {
+		LOG_ERR("Failed to take script lock: %d", err);
+		return err;
+	}
+
+	if (!data->script.active) {
+		err = -EAGAIN;
+	} else {
+		err = msg_get_locked(dev, req, len, rsp, min_rsp_size, K_SECONDS(3), 2);
+	}
+
+	k_sem_give(&data->script.lock);
+
+	return err;
 }
 
 int u_blox_iface_msg_send(const struct device *dev, const struct ubx_frame *req,
@@ -292,6 +414,10 @@ int u_blox_iface_msg_send(const struct device *dev, const struct ubx_frame *req,
 	if (err != 0) {
 		LOG_ERR("Failed to take script lock: %d", err);
 		return err;
+	}
+	if (!data->script.active) {
+		k_sem_give(&data->script.lock);
+		return -EAGAIN;
 	}
 
 	data->script.inst.timeout = K_SECONDS(3);
@@ -315,19 +441,41 @@ int u_blox_iface_msg_payload_send(const struct device *dev, uint8_t class_id, ui
 	struct ubx_frame *frame = (struct ubx_frame *)data->script.request_buf;
 	int err;
 
-	err = k_sem_take(&data->script.req_buf_lock, K_SECONDS(3));
+	/* Take script.lock before req_buf_lock.  PM transitions use script.lock,
+	 * so this order prevents suspend from racing an encoded request buffer.
+	 */
+	err = k_sem_take(&data->script.lock, K_SECONDS(3));
 	if (err != 0) {
 		LOG_ERR("Failed to take script lock: %d", err);
+		return err;
+	}
+	if (!data->script.active) {
+		k_sem_give(&data->script.lock);
+		return -EAGAIN;
+	}
+
+	err = k_sem_take(&data->script.req_buf_lock, K_SECONDS(3));
+	if (err != 0) {
+		LOG_ERR("Failed to take request buffer lock: %d", err);
+		k_sem_give(&data->script.lock);
 		return err;
 	}
 
 	err = ubx_frame_encode(class_id, msg_id, payload, payload_size,
 			       (uint8_t *)frame, sizeof(data->script.request_buf));
 	if (err > 0) {
-		err = u_blox_iface_msg_send(dev, frame, err, wait_for_ack);
+	data->script.inst.timeout = K_SECONDS(3);
+	data->script.inst.retry_count = wait_for_ack ? 2 : 0;
+	data->script.inst.match.filter.class = wait_for_ack ? UBX_CLASS_ID_ACK : 0;
+	data->script.inst.match.filter.id = UBX_MSG_ID_ACK;
+	data->script.inst.request.buf = (const void *)frame;
+	data->script.inst.request.len = err;
+
+	err = modem_ubx_run_script(&data->ubx.inst, &data->script.inst);
 	}
 
 	k_sem_give(&data->script.req_buf_lock);
+	k_sem_give(&data->script.lock);
 
 	return err;
 }

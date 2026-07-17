@@ -10,6 +10,7 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gnss.h>
 #include <zephyr/drivers/gnss/gnss_publish.h>
+#include <zephyr/pm/device.h>
 
 #include <zephyr/modem/ubx.h>
 #include <zephyr/modem/ubx/protocol.h>
@@ -53,7 +54,13 @@ MODEM_UBX_MATCH_ARRAY_DEFINE(u_blox_m10_unsol_messages,
 #endif
 );
 
-static int u_blox_m10_init(const struct device *dev)
+/*
+ * The receiver configuration is repeated after runtime resume because it is
+ * not guaranteed to survive every power-management cycle.  The interface
+ * serializes each UBX script with suspend/resume; callers must not issue GNSS
+ * requests concurrently with a device PM transition.
+ */
+static int u_blox_m10_configure(const struct device *dev)
 {
 	int err;
 	const struct u_blox_iface_config *cfg = dev->config;
@@ -61,12 +68,6 @@ static int u_blox_m10_init(const struct device *dev)
 	const static struct ubx_frame version_get = UBX_FRAME_GET_INITIALIZER(
 						UBX_CLASS_ID_MON, UBX_MSG_ID_MON_VER);
 	struct ubx_mon_ver ver;
-
-	err = u_blox_iface_init(dev, u_blox_m10_unsol_messages,
-			 ARRAY_SIZE(u_blox_m10_unsol_messages), true);
-	if (err < 0) {
-		return err;
-	}
 
 	err = u_blox_iface_msg_get(dev, &version_get,
 				   UBX_FRAME_SZ(version_get.payload_size),
@@ -95,6 +96,27 @@ static int u_blox_m10_init(const struct device *dev)
 	}
 
 	return 0;
+}
+
+static int u_blox_m10_init(const struct device *dev)
+{
+	int err;
+
+	err = u_blox_iface_init(dev, u_blox_m10_unsol_messages,
+				ARRAY_SIZE(u_blox_m10_unsol_messages), true);
+	if (err < 0) {
+		return err;
+	}
+
+#if CONFIG_PM_DEVICE
+	/* Runtime PM owns the first UART open and receiver configuration.  This
+	 * keeps a booted-but-unleased GNSS component completely inactive.
+	 */
+	pm_device_init_suspended(dev);
+	return 0;
+#else
+	return u_blox_m10_configure(dev);
+#endif
 }
 
 static int ubx_m10_set_fix_rate(const struct device *dev, uint32_t fix_interval_ms)
@@ -294,6 +316,44 @@ static int ubx_m10_get_supported_systems(const struct device *dev, gnss_systems_
 	return 0;
 }
 
+#if CONFIG_PM_DEVICE
+static int u_blox_m10_pm_action(const struct device *dev, enum pm_device_action action)
+{
+	int err;
+
+	switch (action) {
+	case PM_DEVICE_ACTION_SUSPEND:
+		return u_blox_iface_suspend(dev);
+	case PM_DEVICE_ACTION_RESUME:
+		err = u_blox_iface_resume(dev);
+		if (err < 0) {
+			return err;
+		}
+
+		err = u_blox_m10_configure(dev);
+		if (err < 0) {
+			/* A cold receiver may still use initial-baudrate.  Preserve the
+			 * legacy boot recovery before declaring this PM resume unusable.
+			 */
+			err = u_blox_iface_configure_baudrate(dev, true);
+			if (err == 0) {
+				err = u_blox_m10_configure(dev);
+			}
+			if (err < 0) {
+				LOG_ERR("Failed to restore M10 configuration: %d", err);
+				/* Keep PM state and usable transport consistent.  A later resume
+				 * retries configuration after this clean detach.
+				 */
+				(void)u_blox_iface_suspend(dev);
+			}
+		}
+		return err;
+	default:
+		return -ENOTSUP;
+	}
+}
+#endif
+
 static DEVICE_API(gnss, ublox_m10_driver_api) = {
 	.set_fix_rate = ubx_m10_set_fix_rate,
 	.get_fix_rate = ubx_m10_get_fix_rate,
@@ -317,10 +377,12 @@ static DEVICE_API(gnss, ublox_m10_driver_api) = {
 	};											\
 												\
 	static struct u_blox_iface_data u_blox_m10_data_##inst;					\
-												\
+										\
+	PM_DEVICE_DT_INST_DEFINE(inst, u_blox_m10_pm_action);					\
+										\
 	DEVICE_DT_INST_DEFINE(inst,								\
 			      u_blox_m10_init,							\
-			      NULL,								\
+			      PM_DEVICE_DT_INST_GET(inst),					\
 			      &u_blox_m10_data_##inst,						\
 			      &u_blox_m10_cfg_##inst,						\
 			      POST_KERNEL, CONFIG_GNSS_INIT_PRIORITY,				\

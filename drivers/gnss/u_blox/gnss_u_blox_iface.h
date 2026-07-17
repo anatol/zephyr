@@ -8,6 +8,8 @@
 #ifndef _GNSS_U_BLOX_IFACE_H_
 #define _GNSS_U_BLOX_IFACE_H_
 
+#include <stdbool.h>
+
 #include <zephyr/device.h>
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gnss.h>
@@ -43,8 +45,20 @@ struct u_blox_iface_data {
 		struct modem_ubx_script inst;
 		uint8_t response_buf[512];
 		uint8_t request_buf[256];
+		/*
+		 * Serializes every UBX script with interface suspend/resume.  The
+		 * lifecycle helpers take this semaphore before detaching the parser,
+		 * so a PM transition can never invalidate a pipe while a script uses
+		 * it.  It is initialized once at boot and is deliberately retained
+		 * across every runtime PM cycle.
+		 */
 		struct k_sem req_buf_lock;
 		struct k_sem lock;
+		/* Protected by @ref lock.  False means the parser is detached and
+		 * message APIs fail immediately instead of waiting on a released UBX
+		 * script semaphore while the GNSS device is suspended.
+		 */
+		bool active;
 	} script;
 #if CONFIG_GNSS_SATELLITES
 	struct gnss_satellite satellites[CONFIG_GNSS_U_BLOX_SATELLITES_COUNT];
@@ -67,6 +81,41 @@ struct u_blox_iface_data {
  */
 int u_blox_iface_init(const struct device *dev, const struct modem_ubx_match *unsol,
 		      size_t unsol_size, bool valset_supported);
+
+/**
+ * @brief Detach the UBX parser and close its UART pipe for runtime suspend.
+ *
+ * Waits for an in-flight UBX script, then prevents new scripts before the
+ * parser is released.  It retains parser, backend, and semaphore objects so
+ * @ref u_blox_iface_resume can reuse them.  Repeated suspends are harmless.
+ *
+ * @param[in] dev	GNSS device instance.
+ *
+ * @return 0 on success, negative errno on failure.
+ */
+int u_blox_iface_suspend(const struct device *dev);
+
+/**
+ * @brief Reopen and reattach the retained UART/UBX interface after suspend.
+ *
+ * This only restores transport and parsing.  The GNSS-specific driver must
+ * restore its receiver configuration after a successful return.  Repeated
+ * resumes while already active are harmless.
+ *
+ * @param[in] dev	GNSS device instance.
+ *
+ * @return 0 on success, negative errno on failure.
+ */
+int u_blox_iface_resume(const struct device *dev);
+
+/**
+ * @brief Recover the receiver's configured UART baud rate and reattach it.
+ *
+ * The caller has already resumed the interface.  This compatibility helper is
+ * used when a cold receiver still speaks its devicetree initial baud rate.
+ * It is not a general GNSS configuration API.
+ */
+int u_blox_iface_configure_baudrate(const struct device *dev, bool valset_supported);
 
 /**
  * @brief Send a UBX formatted request and retrieve the response.
