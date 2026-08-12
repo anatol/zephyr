@@ -15,6 +15,13 @@
 
 #include "flash_stm32.h"
 
+/*
+ * CONFIG_FLASH_SIZE is zero when XIP is disabled. It describes the linkable
+ * executable flash region, not physical hardware. Sector layout must use the
+ * physical flash size declared in devicetree instead.
+ */
+#define STM32F7_FLASH_SIZE_KB (DT_REG_SIZE(DT_INST(0, soc_nv_flash)) / 1024U)
+
 bool flash_stm32_valid_range(const struct device *dev, off_t offset,
 			     uint32_t len,
 			     bool write)
@@ -89,15 +96,15 @@ static int erase_sector(const struct device *dev, uint32_t sector)
 	 * others select sector, so we remap sector number.
 	 */
 #if defined(FLASH_OPTCR_nDBANK) && FLASH_SECTOR_TOTAL == 24
-#if CONFIG_FLASH_SIZE == 2048
+#if STM32F7_FLASH_SIZE_KB == 2048
 	if (sector > 11) {
 		sector += 4U;
 	}
-#elif CONFIG_FLASH_SIZE == 1024
+#elif STM32F7_FLASH_SIZE_KB == 1024
 	if (sector > 7) {
 		sector += 8U;
 	}
-#endif /* CONFIG_FLASH_SIZE */
+#endif /* STM32F7_FLASH_SIZE_KB */
 #endif /* defined(FLASH_OPTCR_nDBANK) && FLASH_SECTOR_TOTAL == 24 */
 
 	regs->CR = (regs->CR & ~(FLASH_CR_PSIZE | FLASH_CR_SNB)) |
@@ -234,21 +241,21 @@ static const struct flash_pages_layout stm32f7_flash_layout[] = {
 	{.pages_count = 4, .pages_size = KB(16)},
 };
 #elif FLASH_SECTOR_TOTAL == 8
-#if CONFIG_FLASH_SIZE == 512
+#if STM32F7_FLASH_SIZE_KB == 512
 static const struct flash_pages_layout stm32f7_flash_layout[] = {
 	/* RM0431, table 3: STM32F72xxx and STM32F732xx/F733xx */
 	{.pages_count = 4, .pages_size = KB(16)},
 	{.pages_count = 1, .pages_size = KB(64)},
 	{.pages_count = 3, .pages_size = KB(128)},
 };
-#elif CONFIG_FLASH_SIZE == 1024
+#elif STM32F7_FLASH_SIZE_KB == 1024
 static const struct flash_pages_layout stm32f7_flash_layout[] = {
 	/* RM0385, table 3: STM32F756xx and STM32F74xxx */
 	{.pages_count = 4, .pages_size = KB(32)},
 	{.pages_count = 1, .pages_size = KB(128)},
 	{.pages_count = 3, .pages_size = KB(256)},
 };
-#endif /* CONFIG_FLASH_SIZE */
+#endif /* STM32F7_FLASH_SIZE_KB */
 #elif FLASH_SECTOR_TOTAL == 24
 static const struct flash_pages_layout stm32f7_flash_layout_single_bank[] = {
 	/* RM0410, table 3: STM32F76xxx and STM32F77xxx in single bank */
