@@ -999,6 +999,9 @@ static int z_ztest_run_test_suite_ptr(struct ztest_suite_node *suite, bool shuff
 	if (test_result != ZTEST_RESULT_SUITE_FAIL && suite->setup != NULL) {
 		data = suite->setup();
 	}
+	if (test_result == ZTEST_RESULT_SUITE_FAIL) {
+		fail = 1;
+	}
 
 	for (int i = 0; i < case_iter; i++) {
 #ifdef CONFIG_ZTEST_SHUFFLE
@@ -1014,7 +1017,7 @@ static int z_ztest_run_test_suite_ptr(struct ztest_suite_node *suite, bool shuff
 			if (strcmp(suite->name, test->test_suite_name) != 0) {
 				continue;
 			}
-			if (ztest_api.should_test_run(suite->name, test->name)) {
+			if (test_result != ZTEST_RESULT_SUITE_FAIL && ztest_api.should_test_run(suite->name, test->name)) {
 				fail += z_ztest_run_test_dispatch(suite, test, data);
 			}
 
@@ -1025,7 +1028,7 @@ static int z_ztest_run_test_suite_ptr(struct ztest_suite_node *suite, bool shuff
 #else
 		for (test = z_ztest_get_next_test(suite->name, NULL); test != NULL;
 		     test = z_ztest_get_next_test(suite->name, test)) {
-			if (ztest_api.should_test_run(suite->name, test->name)) {
+			if (test_result != ZTEST_RESULT_SUITE_FAIL && ztest_api.should_test_run(suite->name, test->name)) {
 				fail += z_ztest_run_test_dispatch(suite, test, data);
 			}
 
